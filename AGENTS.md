@@ -210,3 +210,11 @@ The `.mcp.json` file in the project root enables team-wide MCP tool sharing. AI 
 - Improved debugging and error diagnostics
 - Context-aware code suggestions
 - Live application state querying
+
+## UI & Effect Libraries Guidelines (Libraries.dev)
+
+When implementing or modifying UI components with Libraries.dev (`border-beam`, `thinking-orbs`, `voice-glow`, etc.), agents must strictly adhere to the rules in [LIBRARIES_DEV_AGENT_REQUIREMENTS.md](file:///c:/Users/VISHRUTH/morphic/morphic/LIBRARIES_DEV_AGENT_REQUIREMENTS.md) and [.agents/rules/libraries-dev.md](file:///c:/Users/VISHRUTH/morphic/morphic/.agents/rules/libraries-dev.md):
+- Enforce client boundary (`'use client'`) and dynamic import with `{ ssr: false }` for WebGL components (`img-fx`, `metal-fx`).
+- Never run `border-beam` on idle elements (only during active focus or streaming).
+- Strictly map research states to `thinking-orbs`.
+- Never place text inside containers with `liquid-gooey` SVG filters.

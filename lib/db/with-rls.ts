@@ -42,6 +42,12 @@ export async function withRLS<T>(
 ): Promise<T> {
   try {
     return await db.transaction(async tx => {
+      // In Supabase environments, switch to the authenticated role for this transaction
+      // so PostgreSQL enforces RLS rather than bypassing it as the superuser/owner.
+      if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+        await tx.execute(sql`SET LOCAL ROLE authenticated`)
+      }
+
       // Set the user ID for this transaction
       // Using SET LOCAL ensures it's only valid for this transaction
       // Use pg_catalog.quote_literal for safe escaping

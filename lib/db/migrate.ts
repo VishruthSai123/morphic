@@ -2,7 +2,9 @@ import { drizzle } from 'drizzle-orm/postgres-js'
 import { migrate } from 'drizzle-orm/postgres-js/migrator'
 import postgres from 'postgres'
 
-import 'dotenv/config'
+import dotenv from 'dotenv'
+dotenv.config({ path: '.env.local' })
+dotenv.config()
 
 // This script is used to run migrations on the database
 // Run it with: bun run lib/db/migrate.ts
@@ -15,18 +17,23 @@ const runMigrations = async () => {
 
   const connectionString = process.env.DATABASE_URL
 
-  // Respect DATABASE_SSL_DISABLED flag (used in Docker)
-  // For cloud databases (Supabase, Neon, etc.), use SSL with rejectUnauthorized: false
-  // For local databases (Docker, localhost), disable SSL
+  // Respect DATABASE_SSL_DISABLED flag (used in Docker/local)
+  // For cloud databases (Supabase, Neon, etc.), enable SSL whenever DATABASE_SSL_DISABLED is not 'true'
   const sslDisabled = process.env.DATABASE_SSL_DISABLED === 'true'
-  const isProduction = process.env.NODE_ENV === 'production'
+  const isCloud =
+    connectionString.includes('supabase.co') ||
+    connectionString.includes('supabase.com') ||
+    connectionString.includes('neon.tech') ||
+    connectionString.includes('sslmode=require')
+
+  const ssl = sslDisabled
+    ? false
+    : isCloud || process.env.NODE_ENV === 'production'
+      ? { rejectUnauthorized: false }
+      : false
 
   const sql = postgres(connectionString, {
-    ssl: sslDisabled
-      ? false
-      : isProduction
-        ? { rejectUnauthorized: false }
-        : false,
+    ssl,
     prepare: false
   })
 

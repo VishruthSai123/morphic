@@ -54,6 +54,47 @@ function pickFirstFetchedModel(
   return null
 }
 
+// Known-good default model IDs per provider, used to avoid the expensive
+// fetchAvailableModels() round-trip when only one provider is enabled.
+const PROVIDER_KNOWN_MODELS: Record<string, { id: string; name: string }> = {
+  google: { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+  openai: { id: 'gpt-5.4-mini', name: 'GPT-5.4 mini' },
+  anthropic: { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4' }
+}
+
+/**
+ * When the DEFAULT_MODEL provider isn't enabled, check whether exactly one
+ * provider IS enabled and return a statically-known model for it.  This
+ * prevents intermittent failures caused by transient network errors in the
+ * remote model-list APIs.
+ */
+function resolveDirectProviderFallback(): Model | null {
+  const enabledProviders = [
+    'openai',
+    'anthropic',
+    'google',
+    'openai-compatible',
+    'gateway',
+    'ollama'
+  ].filter(isProviderEnabled)
+
+  if (enabledProviders.length === 0) return null
+
+  // If there's exactly one enabled provider with a known default, use it
+  // directly.  For exotic providers (ollama, openai-compatible, gateway)
+  // we still fall through to fetchAvailableModels.
+  const primary = enabledProviders[0]
+  const knownModel = PROVIDER_KNOWN_MODELS[primary]
+  if (!knownModel) return null
+
+  return {
+    id: knownModel.id,
+    name: knownModel.name,
+    provider: PROVIDER_LABELS[primary] ?? primary,
+    providerId: primary
+  }
+}
+
 interface ModelSelectionParams {
   searchMode?: SearchMode
   cookieStore?: ReadonlyRequestCookies
@@ -135,6 +176,15 @@ export async function selectModel({
 
     if (isProviderEnabled(DEFAULT_MODEL.providerId)) {
       return DEFAULT_MODEL
+    }
+
+    // Fast direct-provider fallback: if exactly one provider is enabled,
+    // return a known-good model immediately without fetching remote model
+    // lists.  This eliminates intermittent failures when the model-list
+    // API is slow or transiently unreachable.
+    const directFallback = resolveDirectProviderFallback()
+    if (directFallback) {
+      return directFallback
     }
 
     return pickFirstFetchedModel(await fetchAvailableModels())
