@@ -55,7 +55,14 @@ export interface AssistQueryPayload {
   query?: string
   messages?: AssistQueryMessage[]
   chatId?: string
-  mode?: 'ambient_companion' | 'hub_research' | 'chat'
+  mode?:
+    | 'chatbot'
+    | 'search'
+    | 'screen_agent'
+    | 'ambient_companion'
+    | 'hub_research'
+    | 'chat'
+  screenContext?: string
   targetContext?: {
     packageName?: string
     selectedText?: string | null
@@ -65,7 +72,7 @@ export interface AssistQueryPayload {
     includeLinks?: boolean
     includeImages?: boolean
     maxResults?: number
-    searchDepth?: 'basic' | 'advanced'
+    searchDepth?: 'basic' | 'advanced' | 'none'
     modelId?: string
   }
 }
@@ -186,28 +193,48 @@ function resolveModelId(requestedModelId?: string): string {
 
 function buildMobileSystemPrompt(
   mode: AssistQueryPayload['mode'],
+  screenContext?: string,
   targetContext?: AssistQueryPayload['targetContext']
 ): string {
   const currentDate = new Date().toLocaleDateString()
-  const contextBlock = targetContext?.selectedText
-    ? `\nThe user has selected the following text in ${targetContext.packageName || 'an app'}:\n"${targetContext.selectedText}"\n`
-    : targetContext?.inputFieldText
-      ? `\nThe user is typing in ${targetContext.packageName || 'an app'}: "${targetContext.inputFieldText}"\n`
-      : ''
+  const contextParts: string[] = []
 
-  const modeInstruction =
-    mode === 'ambient_companion'
-      ? `You are an ambient mobile companion. Be extremely concise and direct. Format for a small mobile overlay:
-- Lead with a 1-2 sentence summary capsule
-- Use bullet points for key facts
-- Keep total response under 150 words
-- Prioritize actionable, insertable text the user can paste into their current app`
-      : mode === 'hub_research'
-        ? `You are a thorough research assistant in a full-screen mobile app. Provide comprehensive, well-structured answers with clear section headings and supporting evidence.`
-        : `You are a helpful conversational assistant on mobile. Be clear, concise, and friendly.`
+  if (screenContext) {
+    contextParts.push(`\nActive Screen / Input Context:\n"""\n${screenContext}\n"""\n`)
+  }
+  if (targetContext?.selectedText) {
+    contextParts.push(`\nThe user has selected text in ${targetContext.packageName || 'an app'}:\n"${targetContext.selectedText}"\n`)
+  }
+  if (targetContext?.inputFieldText) {
+    contextParts.push(`\nThe user is typing in ${targetContext.packageName || 'an app'}: "${targetContext.inputFieldText}"\n`)
+  }
+
+  let modeInstruction = ''
+  if (mode === 'chatbot') {
+    modeInstruction = `You are Morphic Chatbot, an ultra-fast, intelligent, and helpful conversational AI.
+- Answer directly, clearly, and concisely.
+- For writing/drafting/coding requests, provide polished, ready-to-use output immediately.
+- Use formatting (bullet points, bold, code blocks) to make information digestible.
+- Avoid unnecessary preambles or conversational filler.`
+  } else if (mode === 'screen_agent') {
+    modeInstruction = `You are Morphic Screen Agent, a smart on-screen copilot.
+- The user is asking about or working with what is currently on their device screen or in their input field.
+- Ground your response directly on the provided Screen Context.
+- When asked to rewrite, summarize, or fix grammar, provide the clean refined text ready for 1-tap insertion into the host app.
+- Be concise, direct, and actionable.`
+  } else if (mode === 'hub_research') {
+    modeInstruction = `You are a thorough research assistant in a full-screen mobile app. Provide comprehensive, well-structured answers with clear section headings and supporting evidence.`
+  } else {
+    // 'search' or 'ambient_companion'
+    modeInstruction = `You are Morphic Search Assistant, an ambient research companion.
+- Synthesize information from the provided search results with clarity and authority.
+- Cite your sources naturally using [1], [2], etc.
+- Lead with a concise summary capsule, then bullet points for key facts.
+- Keep output crisp, structured, and easy to read on mobile.`
+  }
 
   return `${modeInstruction}
-${contextBlock}
+${contextParts.join('\n')}
 Current date: ${currentDate}
 
 Instructions:
@@ -246,6 +273,7 @@ export async function POST(req: Request) {
     messages,
     chatId,
     mode = 'ambient_companion',
+    screenContext,
     targetContext,
     options
   } = body
@@ -269,7 +297,8 @@ export async function POST(req: Request) {
   const includeLinks = options?.includeLinks !== false
   const includeImages = options?.includeImages !== false
   const maxResults = Math.min(options?.maxResults ?? 5, 10)
-  const searchDepth = options?.searchDepth ?? 'basic'
+  const searchDepth: 'basic' | 'advanced' =
+    options?.searchDepth === 'advanced' ? 'advanced' : 'basic'
 
   // 3. Resolve model
   const modelId = resolveModelId(options?.modelId)
@@ -373,48 +402,54 @@ export async function POST(req: Request) {
       })
 
       try {
-        // ── Step A: Search ──────────────────────────────────────────────
-        emit('status', {
-          step: 'searching',
-          message: 'Searching the web...'
-        })
+        const isChatbot = mode === 'chatbot'
+        let searchResults: SearchResults = { results: [], images: [], query }
 
-        const searchProvider = createSearchProvider()
-        let searchResults: SearchResults
-
-        try {
-          searchResults = await searchProvider.search(
-            query,
-            maxResults,
-            searchDepth,
-            [], // includeDomains
-            [], // excludeDomains
-            { type: 'general', content_types: ['web', 'image'] }
-          )
-        } catch (searchErr) {
-          console.error('[AssistQuery] Search failed:', searchErr)
-          // Continue without search results — the LLM will answer from memory
-          searchResults = { results: [], images: [], query }
-        }
-
-        // Emit links immediately if available
-        if (includeLinks && searchResults.results.length > 0) {
-          emit('links', {
-            links: mapResultsToLinks(searchResults.results, maxResults)
+        if (!isChatbot) {
+          // ── Step A: Search ──────────────────────────────────────────────
+          emit('status', {
+            step: 'searching',
+            message:
+              mode === 'screen_agent'
+                ? 'Analyzing screen & web...'
+                : 'Searching the web...'
           })
-        }
 
-        // Emit images immediately if available
-        if (includeImages && searchResults.images.length > 0) {
-          emit('images', {
-            images: mapImagesToSSE(searchResults.images, maxResults)
-          })
+          const searchProvider = createSearchProvider()
+          try {
+            searchResults = await searchProvider.search(
+              query,
+              maxResults,
+              searchDepth,
+              [], // includeDomains
+              [], // excludeDomains
+              { type: 'general', content_types: ['web', 'image'] }
+            )
+          } catch (searchErr) {
+            console.error('[AssistQuery] Search failed:', searchErr)
+            // Continue without search results — the LLM will answer from memory
+            searchResults = { results: [], images: [], query }
+          }
+
+          // Emit links immediately if available
+          if (includeLinks && searchResults.results.length > 0) {
+            emit('links', {
+              links: mapResultsToLinks(searchResults.results, maxResults)
+            })
+          }
+
+          // Emit images immediately if available
+          if (includeImages && searchResults.images.length > 0) {
+            emit('images', {
+              images: mapImagesToSSE(searchResults.images, maxResults)
+            })
+          }
         }
 
         // ── Step B: LLM Synthesis ───────────────────────────────────────
         emit('status', {
           step: 'synthesizing',
-          message: 'Generating answer...'
+          message: isChatbot ? 'Thinking...' : 'Generating answer...'
         })
 
         // Build context from search results for the LLM
@@ -428,11 +463,18 @@ export async function POST(req: Request) {
                 .join('\n\n')
             : ''
 
-        const userMessage = searchContext
-          ? `Based on the following search results, answer the user's question.\n\nSearch Results:\n${searchContext}\n\nUser Question: ${query}`
-          : query
+        let userMessage = query
+        if (searchContext) {
+          userMessage = `Based on the following search results, answer the user's question.\n\nSearch Results:\n${searchContext}\n\nUser Question: ${query}`
+        } else if (screenContext) {
+          userMessage = `User Question: ${query}\n\nActive Screen / Input Context:\n"""\n${screenContext}\n"""`
+        }
 
-        const systemPrompt = buildMobileSystemPrompt(mode, targetContext)
+        const systemPrompt = buildMobileSystemPrompt(
+          mode,
+          screenContext,
+          targetContext
+        )
 
         // Support multi-turn history when messages are passed
         const hasHistory = Array.isArray(messages) && messages.length > 1
