@@ -50,14 +50,79 @@ export interface MobileAuthResult {
   error?: string
 }
 
+function parseCookieHeader(
+  cookieHeader: string | null
+): Record<string, string> {
+  if (!cookieHeader) return {}
+  const cookies: Record<string, string> = {}
+  cookieHeader.split(';').forEach(pair => {
+    const idx = pair.indexOf('=')
+    if (idx > -1) {
+      const key = pair.substring(0, idx).trim()
+      const val = pair.substring(idx + 1).trim()
+      cookies[key] = val
+    }
+  })
+  return cookies
+}
+
+const TOKEN_COOKIE_REGEX = /^sb-[a-zA-Z0-9_-]+-auth-token(?:\.\d+)?$/
+
+/**
+ * Extracts a Supabase JWT from cookie chunks (e.g. sb-*-auth-token or sb-*-auth-token.0, .1).
+ */
+function extractTokenFromCookieMap(
+  cookieMap: Record<string, string>
+): string | null {
+  // Strictly find auth token keys, excluding -code-verifier
+  const tokenKeys = Object.keys(cookieMap).filter(
+    k => TOKEN_COOKIE_REGEX.test(k) && !k.endsWith('-code-verifier')
+  )
+
+  if (tokenKeys.length === 0) return null
+
+  // If unchunked cookie is present, use it directly
+  const unchunkedKey = tokenKeys.find(k => !k.includes('.'))
+  let rawValue: string
+
+  if (unchunkedKey) {
+    rawValue = cookieMap[unchunkedKey]
+  } else {
+    // Sort chunked keys by index (.0, .1, etc.)
+    tokenKeys.sort((a, b) => {
+      const aIdx = parseInt(a.slice(a.lastIndexOf('.') + 1), 10) || 0
+      const bIdx = parseInt(b.slice(b.lastIndexOf('.') + 1), 10) || 0
+      return aIdx - bIdx
+    })
+    rawValue = tokenKeys.map(k => cookieMap[k]).join('')
+  }
+
+  try {
+    const raw = decodeURIComponent(rawValue)
+    const jsonStr = raw.startsWith('base64-')
+      ? Buffer.from(raw.slice(7), 'base64').toString('utf8')
+      : raw
+    const parsed = JSON.parse(jsonStr)
+    if (parsed.access_token) return parsed.access_token
+    if (Array.isArray(parsed) && typeof parsed[0] === 'string') return parsed[0]
+  } catch {
+    const jwtMatch = rawValue.match(
+      /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/
+    )
+    if (jwtMatch) return jwtMatch[0]
+  }
+
+  return null
+}
+
 /**
  * Resolves the user identity from an incoming mobile request.
  *
  * Priority:
  * 1. If anonymous mode is active, use `X-Morphic-Anonymous-Id` header
  *    or fall back to `ANONYMOUS_USER_ID` env var / default.
- * 2. If auth is enabled, validate `Authorization: Bearer <jwt>` against
- *    Supabase and resolve the uid.
+ * 2. If auth is enabled, validate `Authorization: Bearer <jwt>` or
+ *    Supabase session cookies from the client against Supabase.
  * 3. If neither is satisfied, return unauthenticated.
  */
 export async function resolveMobileAuth(
@@ -77,41 +142,6 @@ export async function resolveMobileAuth(
     }
   }
 
-  // ----- Supabase JWT Mode (Production Cloud) -----
-  const authHeader = request.headers.get('authorization')
-  let token: string | null = null
-
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.slice('Bearer '.length).trim()
-  } else {
-    // Attempt cookie-based session extraction for web-to-mobile bridge requests
-    const cookieHeader = request.headers.get('cookie')
-    if (cookieHeader) {
-      const match = cookieHeader.match(/sb-[^=]+-auth-token(?:%2E\d+)?=([^;]+)/)
-      if (match && match[1]) {
-        try {
-          const raw = decodeURIComponent(match[1])
-          const jsonStr = raw.startsWith('base64-')
-            ? Buffer.from(raw.slice(7), 'base64').toString('utf8')
-            : raw
-          const parsed = JSON.parse(jsonStr)
-          token = parsed.access_token || (Array.isArray(parsed) ? parsed[0] : null)
-        } catch {
-          const jwtMatch = match[1].match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/)
-          if (jwtMatch) token = jwtMatch[0]
-        }
-      }
-    }
-  }
-
-  if (!token) {
-    return {
-      authenticated: false,
-      method: 'none',
-      error: 'Missing or invalid Authorization header. Expected: Bearer <jwt>'
-    }
-  }
-
   if (!hasSupabasePublicConfig()) {
     return {
       authenticated: false,
@@ -121,19 +151,77 @@ export async function resolveMobileAuth(
     }
   }
 
+  const { createServerClient } = await import('@supabase/ssr')
+  const { getSupabasePublishableKey } = await import('@/lib/supabase/keys')
+  const supabaseKey = getSupabasePublishableKey()!
+
+  // 1. Try resolving via request cookies using official @supabase/ssr client
+  const cookieHeader = request.headers.get('cookie')
+  const cookieMap = parseCookieHeader(cookieHeader)
+
+  if (Object.keys(cookieMap).length > 0) {
+    try {
+      const ssrClient = createServerClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL!,
+        supabaseKey,
+        {
+          cookies: {
+            getAll() {
+              return Object.entries(cookieMap).map(([name, value]) => ({
+                name,
+                value
+              }))
+            },
+            setAll() {}
+          }
+        }
+      )
+      const {
+        data: { user },
+        error
+      } = await ssrClient.auth.getUser()
+
+      if (user && !error) {
+        return {
+          authenticated: true,
+          userId: user.id,
+          method: 'supabase_jwt'
+        }
+      }
+    } catch (e) {
+      console.warn('[MobileAuth] SSR cookie auth attempt failed:', e)
+    }
+  }
+
+  // 2. Try resolving via Bearer token in Authorization header or extracted cookie JWT
+  const authHeader = request.headers.get('authorization')
+  let token: string | null = null
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.slice('Bearer '.length).trim()
+  } else {
+    token = extractTokenFromCookieMap(cookieMap)
+  }
+
+  if (!token) {
+    return {
+      authenticated: false,
+      method: 'none',
+      error:
+        'Missing or invalid Authorization header or Supabase session cookie.'
+    }
+  }
+
   try {
-    // If SUPABASE_SECRET_KEY is configured, prefer admin client;
-    // otherwise fall back to standard Supabase client with publishable key.
     let supabase
     if (process.env.SUPABASE_SECRET_KEY) {
       const { createAdminClient } = await import('@/lib/supabase/admin')
       supabase = createAdminClient()
     } else {
       const { createClient } = await import('@supabase/supabase-js')
-      const { getSupabasePublishableKey } = await import('@/lib/supabase/keys')
       supabase = createClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL!,
-        getSupabasePublishableKey()!,
+        supabaseKey,
         {
           auth: { autoRefreshToken: false, persistSession: false }
         }
@@ -159,7 +247,7 @@ export async function resolveMobileAuth(
       method: 'supabase_jwt'
     }
   } catch (err) {
-    console.error('[MobileAuth] Supabase JWT validation failed:', err)
+    console.error('[MobileAuth] Supabase JWT validation error:', err)
     return {
       authenticated: false,
       method: 'supabase_jwt',

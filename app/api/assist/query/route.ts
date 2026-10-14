@@ -23,7 +23,10 @@
  */
 
 import { streamText } from 'ai'
+import { revalidateTag } from 'next/cache'
 
+import { createChatWithFirstMessage, upsertMessage } from '@/lib/actions/chat'
+import { generateChatTitle } from '@/lib/agents/title-generator'
 import {
   corsErrorResponse,
   handleCorsPreflightRequest,
@@ -31,8 +34,11 @@ import {
   withCorsHeaders
 } from '@/lib/api/mobile-cors'
 import { resolveMobileAuth } from '@/lib/api/mobile-auth'
+import { updateChatTitle } from '@/lib/db/actions'
+import { generateId } from '@/lib/db/schema'
 import { createSearchProvider } from '@/lib/tools/search/providers'
 import { SearchResults, SearchResultItem } from '@/lib/types'
+import type { UIMessage } from '@/lib/types/ai'
 import { getModel, isProviderEnabled } from '@/lib/utils/registry'
 import { DEFAULT_MODEL } from '@/lib/config/default-model'
 
@@ -289,7 +295,63 @@ export async function POST(req: Request) {
     )
   }
 
-  // 4. Build SSE response stream
+  // 4. Set up Real Persistent Chat & User Message
+  const effectiveChatId = chatId || generateId()
+  const isNewChat = !chatId
+  const userId = auth.userId!
+
+  const userMessageId = generateId()
+  const userUIMessage: UIMessage = {
+    id: userMessageId,
+    role: 'user',
+    parts: [{ type: 'text', text: query }]
+  }
+
+  let titlePromise: Promise<string> | undefined
+  if (isNewChat) {
+    titlePromise = generateChatTitle({
+      userMessageContent: query,
+      modelId,
+      abortSignal: req.signal
+    }).catch(err => {
+      console.warn('[AssistQuery] Title generation warning:', err)
+      return query.slice(0, 50) || 'Search'
+    })
+
+    try {
+      await createChatWithFirstMessage(
+        effectiveChatId,
+        userUIMessage,
+        userId,
+        query.slice(0, 50) || 'Search'
+      )
+    } catch (createErr) {
+      console.error('[AssistQuery] Initial chat creation error:', createErr)
+      try {
+        await upsertMessage(effectiveChatId, userUIMessage, userId)
+      } catch (upsertErr) {
+        console.error('[AssistQuery] Fallback upsert error:', upsertErr)
+      }
+    }
+  } else {
+    try {
+      await upsertMessage(effectiveChatId, userUIMessage, userId)
+    } catch (upsertErr) {
+      console.warn('[AssistQuery] Append message error:', upsertErr)
+      try {
+        await createChatWithFirstMessage(
+          effectiveChatId,
+          userUIMessage,
+          userId,
+          query.slice(0, 50) || 'Search'
+        )
+      } catch (fallbackErr) {
+        console.error('[AssistQuery] Fallback create error:', fallbackErr)
+      }
+    }
+  }
+
+  // 5. Build SSE response stream
   const encoder = new TextEncoder()
   const abortSignal = req.signal
 
@@ -302,6 +364,13 @@ export async function POST(req: Request) {
         if (abortSignal.aborted) return
         controller.enqueue(encoder.encode(sseEvent(event, data)))
       }
+
+      // Emit init event with authentic chatId so mobile client can store it immediately
+      emit('init', {
+        chatId: effectiveChatId,
+        sessionId: effectiveChatId,
+        userId
+      })
 
       try {
         // ── Step A: Search ──────────────────────────────────────────────
@@ -389,22 +458,78 @@ export async function POST(req: Request) {
 
         const result = streamText(streamOptions)
 
+        let accumulatedAnswer = ''
+
         // Stream answer chunks as they arrive
         for await (const textPart of result.textStream) {
           if (abortSignal.aborted) break
           if (textPart) {
+            accumulatedAnswer += textPart
             emit('answer_chunk', { text: textPart })
           }
         }
 
-        // ── Step C: Done ────────────────────────────────────────────────
+        // ── Step C: Persist Assistant Answer & Citations to DB ─────────
+        if (accumulatedAnswer) {
+          const assistantMsgId = generateId()
+          const assistantParts: any[] = [
+            { type: 'text', text: accumulatedAnswer }
+          ]
+          // Add real source-url parts for Morphic web citations
+          for (const item of searchResults.results) {
+            assistantParts.push({
+              type: 'source-url',
+              sourceId: item.url,
+              url: item.url,
+              title: item.title
+            })
+          }
+
+          const assistantMessage: UIMessage = {
+            id: assistantMsgId,
+            role: 'assistant',
+            parts: assistantParts
+          }
+
+          try {
+            await upsertMessage(effectiveChatId, assistantMessage, userId)
+          } catch (saveErr) {
+            console.error(
+              '[AssistQuery] Failed to save assistant message:',
+              saveErr
+            )
+          }
+
+          if (titlePromise) {
+            try {
+              const generatedTitle = await titlePromise
+              if (generatedTitle && generatedTitle !== 'Search') {
+                await updateChatTitle(effectiveChatId, generatedTitle, userId)
+              }
+            } catch (titleErr) {
+              console.warn(
+                '[AssistQuery] Failed to update chat title:',
+                titleErr
+              )
+            }
+          }
+
+          // Trigger cache revalidation so sidebar and /search/[id] load fresh state
+          try {
+            revalidateTag('chat', 'max')
+            revalidateTag(`chat-${effectiveChatId}`, 'max')
+          } catch (revalErr) {
+            console.warn('[AssistQuery] Cache revalidation warning:', revalErr)
+          }
+        }
+
+        // ── Step D: Done ────────────────────────────────────────────────
         const durationMs = Math.round(performance.now() - startTime)
-        const finalSessionId = chatId || `sess_${Date.now()}`
         emit('done', {
-          sessionId: finalSessionId,
-          chatId: finalSessionId,
+          sessionId: effectiveChatId,
+          chatId: effectiveChatId,
           durationMs,
-          userId: auth.userId,
+          userId,
           resultCount: searchResults.results.length,
           imageCount: searchResults.images.length
         })
