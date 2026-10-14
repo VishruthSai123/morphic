@@ -79,8 +79,32 @@ export async function resolveMobileAuth(
 
   // ----- Supabase JWT Mode (Production Cloud) -----
   const authHeader = request.headers.get('authorization')
+  let token: string | null = null
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.slice('Bearer '.length).trim()
+  } else {
+    // Attempt cookie-based session extraction for web-to-mobile bridge requests
+    const cookieHeader = request.headers.get('cookie')
+    if (cookieHeader) {
+      const match = cookieHeader.match(/sb-[^=]+-auth-token(?:%2E\d+)?=([^;]+)/)
+      if (match && match[1]) {
+        try {
+          const raw = decodeURIComponent(match[1])
+          const jsonStr = raw.startsWith('base64-')
+            ? Buffer.from(raw.slice(7), 'base64').toString('utf8')
+            : raw
+          const parsed = JSON.parse(jsonStr)
+          token = parsed.access_token || (Array.isArray(parsed) ? parsed[0] : null)
+        } catch {
+          const jwtMatch = match[1].match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/)
+          if (jwtMatch) token = jwtMatch[0]
+        }
+      }
+    }
+  }
+
+  if (!token) {
     return {
       authenticated: false,
       method: 'none',
@@ -96,8 +120,6 @@ export async function resolveMobileAuth(
         'Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and keys.'
     }
   }
-
-  const token = authHeader.slice('Bearer '.length).trim()
 
   try {
     // If SUPABASE_SECRET_KEY is configured, prefer admin client;

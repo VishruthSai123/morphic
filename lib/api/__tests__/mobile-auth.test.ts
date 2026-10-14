@@ -137,4 +137,35 @@ describe('mobile-auth resolver', () => {
     expect(auth.userId).toBe('usr_supabase_public_456')
     expect(auth.method).toBe('supabase_jwt')
   })
+
+  it('authenticates via Supabase session cookie when Authorization header is absent', async () => {
+    process.env.ENABLE_AUTH = 'true'
+    process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://fake-supabase.co'
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = 'fake-key'
+    delete process.env.SUPABASE_SECRET_KEY
+
+    const supabaseJs = await import('@supabase/supabase-js')
+    vi.spyOn(supabaseJs, 'createClient').mockReturnValue({
+      auth: {
+        getUser: vi.fn().mockResolvedValue({
+          data: { user: { id: 'usr_from_cookie_789' } },
+          error: null
+        })
+      }
+    } as any)
+
+    const cookiePayload = encodeURIComponent(
+      JSON.stringify({ access_token: 'cookie_jwt_token_123' })
+    )
+    const req = new Request('http://localhost:3000/api/assist/query', {
+      headers: {
+        Cookie: `sb-fake-auth-token=${cookiePayload}; other=123`
+      }
+    })
+    const auth = await resolveMobileAuth(req)
+
+    expect(auth.authenticated).toBe(true)
+    expect(auth.userId).toBe('usr_from_cookie_789')
+    expect(auth.method).toBe('supabase_jwt')
+  })
 })
